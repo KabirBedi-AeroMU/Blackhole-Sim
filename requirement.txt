@@ -1,0 +1,7 @@
+PYTHON LIBRARIES REQUIRED :
+
+numpy
+pycuda
+vispy
+sympy
+PyQt5
