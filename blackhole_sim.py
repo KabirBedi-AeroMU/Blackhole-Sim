@@ -25,7 +25,7 @@ print("[2/3] Compiling C++ PyCUDA parallel acceleration kernel...")
 cuda_code = """
 #include <math.h>
 
-__global__ void render_blackhole(unsigned char *rgba, int width, int height, float M, float cam_height, float cam_dist, float ton_618, float m87, float zoom_factor, float optical_filter) {
+__global__ void render_blackhole(unsigned char *rgba, int width, int height, float M, float cam_height, float cam_dist, float ton_618, float m87, float zoom_factor, float optical_filter, float obj_active, float obj_x, float obj_y, float obj_z, float obj_stretch) {
     int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
     int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
     
@@ -43,7 +43,6 @@ __global__ void render_blackhole(unsigned char *rgba, int width, int height, flo
     float v_mag = sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
     vel.x /= v_mag; vel.y /= v_mag; vel.z /= v_mag;
     
-    // Increased raymarching step size and max steps to allow massive zoom-outs
     float dt = 0.08f * M; 
     float3 color = make_float3(0.0f, 0.0f, 0.0f); 
     
@@ -65,8 +64,110 @@ __global__ void render_blackhole(unsigned char *rgba, int width, int height, flo
             break; 
         }
         
+        // --- FALLING OBJECT (SPAGHETTIFICATION LOGIC) ---
+        if (obj_active > 0.5f) {
+            float3 r_dir = make_float3(obj_x, obj_y, obj_z); // Vector towards singularity
+            float r_len = sqrt(r_dir.x*r_dir.x + r_dir.y*r_dir.y + r_dir.z*r_dir.z);
+            
+            if (r_len > 0.1f) {
+                // Normalize radial vector (Gravity gradient)
+                r_dir.x /= r_len; r_dir.y /= r_len; r_dir.z /= r_len;
+                
+                // Tidal locking: Head points directly away from singularity, feet towards it.
+                float3 up = make_float3(-r_dir.x, -r_dir.y, -r_dir.z); 
+                
+                // Construct orthogonal basis (fwd and right)
+                float3 fwd = make_float3(0.0f, 1.0f, 0.0f);
+                if (fabs(up.y) > 0.95f) {
+                    fwd = make_float3(1.0f, 0.0f, 0.0f);
+                }
+                float3 right = make_float3(up.y*fwd.z - up.z*fwd.y, up.z*fwd.x - up.x*fwd.z, up.x*fwd.y - up.y*fwd.x);
+                float right_len = sqrt(right.x*right.x + right.y*right.y + right.z*right.z);
+                right.x /= right_len; right.y /= right_len; right.z /= right_len;
+                fwd = make_float3(right.y*up.z - right.z*up.y, right.z*up.x - right.x*up.z, right.x*up.y - right.y*up.x);
+                
+                // Ray offset from object center
+                float3 d = make_float3(pos.x - obj_x, pos.y - obj_y, pos.z - obj_z);
+                
+                // Project ray into local orientation
+                float lx = d.x*right.x + d.y*right.y + d.z*right.z;
+                float ly = d.x*up.x + d.y*up.y + d.z*up.z;
+                float lz = d.x*fwd.x + d.y*fwd.y + d.z*fwd.z;
+                
+                float S = obj_stretch;
+                float s = 0.25f * M; // Base scale of the dummy
+                
+                // SPAGHETTIFICATION MATH (Stretching Space itself)
+                // Tidal forces stretch the space massively along the 'up' axis (ly)
+                // and compress the space laterally along 'lx' and 'lz'.
+                float sx = lx * sqrtf(S);
+                float sy = ly / S;
+                float sz = lz * sqrtf(S);
+                
+                // Bounding sphere check (Optimizes the GPU kernel)
+                if (sx*sx + sy*sy + sz*sz < (3.5f*s * 3.5f*s)) {
+                    bool hit_dummy = false;
+
+                    // Head (Sphere)
+                    float head_r2 = sx*sx + (sy - 1.5f*s)*(sy - 1.5f*s) + sz*sz;
+                    if (head_r2 < (0.45f*s * 0.45f*s)) hit_dummy = true;
+
+                    // Torso (Capsule)
+                    if (!hit_dummy) {
+                        float hy = fmaxf(-0.5f*s, fminf(1.0f*s, sy));
+                        float torso_r2 = sx*sx + (sy - hy)*(sy - hy) + sz*sz;
+                        if (torso_r2 < (0.35f*s * 0.35f*s)) hit_dummy = true;
+                    }
+                    
+                    // Arms (Capsules)
+                    if (!hit_dummy) {
+                        float3 pa, ba, dist_vec; float h;
+                        
+                        // Left Arm (Flailing outwards)
+                        pa = make_float3(sx - 0.4f*s, sy - 0.8f*s, sz);
+                        ba = make_float3(0.8f*s, -1.2f*s, 0.0f);
+                        h = fmaxf(0.0f, fminf(1.0f, (pa.x*ba.x + pa.y*ba.y + pa.z*ba.z)/(ba.x*ba.x + ba.y*ba.y + ba.z*ba.z)));
+                        dist_vec = make_float3(pa.x - ba.x*h, pa.y - ba.y*h, pa.z - ba.z*h);
+                        if (dist_vec.x*dist_vec.x + dist_vec.y*dist_vec.y + dist_vec.z*dist_vec.z < (0.12f*s * 0.12f*s)) hit_dummy = true;
+                        
+                        // Right Arm (Flailing outwards)
+                        pa = make_float3(sx + 0.4f*s, sy - 0.8f*s, sz);
+                        ba = make_float3(-0.8f*s, -1.2f*s, 0.0f);
+                        h = fmaxf(0.0f, fminf(1.0f, (pa.x*ba.x + pa.y*ba.y + pa.z*ba.z)/(ba.x*ba.x + ba.y*ba.y + ba.z*ba.z)));
+                        dist_vec = make_float3(pa.x - ba.x*h, pa.y - ba.y*h, pa.z - ba.z*h);
+                        if (dist_vec.x*dist_vec.x + dist_vec.y*dist_vec.y + dist_vec.z*dist_vec.z < (0.12f*s * 0.12f*s)) hit_dummy = true;
+                    }
+
+                    // Legs (Capsules)
+                    if (!hit_dummy) {
+                        float3 pa, ba, dist_vec; float h;
+                        
+                        // Left Leg
+                        pa = make_float3(sx - 0.2f*s, sy + 0.5f*s, sz);
+                        ba = make_float3(0.4f*s, -2.0f*s, 0.0f);
+                        h = fmaxf(0.0f, fminf(1.0f, (pa.x*ba.x + pa.y*ba.y + pa.z*ba.z)/(ba.x*ba.x + ba.y*ba.y + ba.z*ba.z)));
+                        dist_vec = make_float3(pa.x - ba.x*h, pa.y - ba.y*h, pa.z - ba.z*h);
+                        if (dist_vec.x*dist_vec.x + dist_vec.y*dist_vec.y + dist_vec.z*dist_vec.z < (0.15f*s * 0.15f*s)) hit_dummy = true;
+                        
+                        // Right Leg
+                        pa = make_float3(sx + 0.2f*s, sy + 0.5f*s, sz);
+                        ba = make_float3(-0.4f*s, -2.0f*s, 0.0f);
+                        h = fmaxf(0.0f, fminf(1.0f, (pa.x*ba.x + pa.y*ba.y + pa.z*ba.z)/(ba.x*ba.x + ba.y*ba.y + ba.z*ba.z)));
+                        dist_vec = make_float3(pa.x - ba.x*h, pa.y - ba.y*h, pa.z - ba.z*h);
+                        if (dist_vec.x*dist_vec.x + dist_vec.y*dist_vec.y + dist_vec.z*dist_vec.z < (0.15f*s * 0.15f*s)) hit_dummy = true;
+                    }
+
+                    if (hit_dummy) {
+                        // Cyan/White Spacesuit Glow
+                        color.x += 1.5f * dt; 
+                        color.y += 4.5f * dt;
+                        color.z += 5.0f * dt; 
+                    }
+                }
+            }
+        }
+        
         // --- REALISTIC 3D QUASAR PLASMA JETS ---
-        // Jets show for TON 618 always, and for M87 when the optical filter is OFF
         if (ton_618 > 0.5f || (m87 > 0.5f && optical_filter < 0.5f)) {
             float abs_y = fabs(pos.y);
             if (abs_y > 2.0f * M) { 
@@ -97,12 +198,10 @@ __global__ void render_blackhole(unsigned char *rgba, int width, int height, flo
                     
                     if (jet_intensity > 0.0f) {
                         if (m87 > 0.5f) {
-                            // M87: Blinding white/blue-white jets
                             color.x += jet_intensity * 0.9f; 
                             color.y += jet_intensity * 0.9f; 
                             color.z += jet_intensity * 1.0f; 
                         } else {
-                            // TON 618: Deep cyan jets
                             color.x += jet_intensity * 0.35f; 
                             color.y += jet_intensity * 0.85f; 
                             color.z += jet_intensity * 1.5f;  
@@ -135,16 +234,12 @@ __global__ void render_blackhole(unsigned char *rgba, int width, int height, flo
                         color.y += (intensity * intensity) * 1.8f * subtle_ring; 
                         color.z += intensity * 2.5f * subtle_ring; 
                     } else if (m87 > 0.5f) {
-                        // THE M87 PROFESSOR EXPLANATION: RELATIVISTIC DOPPLER BEAMING
                         float doppler = 1.0f - 0.85f * (cross_x / cross_r); 
-                        
                         if (optical_filter < 0.5f) {
-                            // FILTER OFF: Blindingly bright core, almost star-like
                             color.x += intensity * 4.0f * doppler * subtle_ring; 
                             color.y += intensity * 3.5f * doppler * subtle_ring; 
                             color.z += intensity * 3.0f * doppler * subtle_ring;  
                         } else {
-                            // FILTER ON: The famous dim orange radio image
                             color.x += intensity * 1.8f * doppler * subtle_ring; 
                             color.y += (intensity * intensity) * 0.6f * doppler * subtle_ring; 
                             color.z += (intensity * intensity * intensity) * 0.1f * doppler * subtle_ring;  
@@ -230,13 +325,10 @@ __global__ void render_blackhole(unsigned char *rgba, int width, int height, flo
             s_dir.x /= l; s_dir.y /= l; s_dir.z /= l;
             
             float dot_p = vel.x*s_dir.x + vel.y*s_dir.y + vel.z*s_dir.z;
-            
-            float base_size = 1.0f - star_sizes[i];
-            float adjusted_size = base_size * (1.0f / zoom_factor);
-            float thresh = 1.0f - adjusted_size;
+            float thresh = star_sizes[i];
             
             if (dot_p > thresh) { 
-                float brightness_mult = 1.0f / adjusted_size;
+                float brightness_mult = 1.0f / (1.0f - thresh);
                 float intensity = (dot_p - thresh) * brightness_mult * 1.5f;
                 
                 color.x += intensity * star_colors[i].x;
@@ -292,21 +384,29 @@ class BlackHoleCanvas(scene.SceneCanvas):
         self.m87_mode = 0.0
         self.zoom_factor = 1.0 
         self.is_dead = False # Track if the satellite crashed
-        self.optical_filter = 1.0 # Tracks the J key filter
+        self.optical_filter = 1.0 
         
-        # HUD OVERLAY (Now anchored to the CENTER horizontally)
+        # Thrown Object Physics Parameters
+        self.obj_active = 0.0
+        self.obj_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.obj_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.obj_stretch = 1.0
+        
+        # Timer for animating the thrown object at 30 FPS
+        self.timer = app.Timer(interval=1.0/30.0, connect=self.on_timer, start=False)
+        
+        # HUD OVERLAY
         self.mass_text = scene.visuals.Text(
             text=f"Solar Mass: {self.mass:,.1f} M",
             color='#00ffff', 
             font_size=18,
             bold=True,
-            anchor_x='center', # Centers the text origin horizontally
+            anchor_x='center',
             anchor_y='center',
             parent=self.scene,
-            pos=(self.width // 2, 40) # Positioned dead center at the top
+            pos=(self.width // 2, 40)
         )
         
-        # DEATH SCREEN TEXT 
         self.death_text = scene.visuals.Text(
             text="Satellite got caught in magnetic field of Blackhole\nPress ENTER to restart",
             color='#ff3333', 
@@ -319,7 +419,6 @@ class BlackHoleCanvas(scene.SceneCanvas):
         )
         self.death_text.visible = False
         
-        # OPTICAL FILTER TEXT (Now anchored to the CENTER horizontally, just below Mass Text)
         self.filter_text = scene.visuals.Text(
             text="Optical filter is turned on",
             color='#aaaaaa', 
@@ -328,21 +427,93 @@ class BlackHoleCanvas(scene.SceneCanvas):
             anchor_x='center', 
             anchor_y='center', 
             parent=self.scene,
-            pos=(self.width // 2, 80) # Positioned right underneath the Solar Mass text
+            pos=(self.width // 2, 80)
         )
         self.filter_text.visible = False
         
+        self.spaghetti_text = scene.visuals.Text(
+            text="Astronaut Dummy Launched! Monitoring Spaghettification...",
+            color='#00ffff', 
+            font_size=16,
+            bold=True,
+            anchor_x='center', 
+            anchor_y='center', 
+            parent=self.scene,
+            pos=(self.width // 2, self.height - 40)
+        )
+        self.spaghetti_text.visible = False
+        
+        # Register Mouse Press Event
+        self.events.mouse_press.connect(self.on_mouse_press)
+        
         self.update_simulation()
         self.freeze()
-        
-    def trigger_death(self):
+
+    def on_mouse_press(self, event):
+        if event.button == 1 and not self.is_dead: # Left Click
+            # Launch object slightly closer to the camera view for better visibility
+            self.obj_pos = np.array([-self.mass * 1.5, self.cam_height * 0.5, -self.cam_dist * 0.5], dtype=np.float32)
+            
+            # LOWERED tangential velocity massively so it is guaranteed to plunge and not orbit/escape
+            self.obj_vel = np.array([self.mass * 0.005, -self.mass * 0.002, self.mass * 0.015], dtype=np.float32)
+            
+            self.obj_active = 1.0
+            self.obj_stretch = 1.0
+            self.spaghetti_text.visible = True
+            
+            if not self.timer.running:
+                self.timer.start()
+                
+            self.update_simulation()
+            
+    def on_timer(self, event):
+        if self.obj_active == 1.0:
+            r_mag = np.linalg.norm(self.obj_pos)
+            
+            # 1. TIME DILATION MATH: Time slows down for the outside observer as it approaches the horizon
+            dilation_factor = max(0.0, 1.0 - (2.0 * self.mass / r_mag))
+            
+            # 2. END SIMULATION Check: If time freezes or it hits the horizon, end it!
+            if dilation_factor < 0.08 or r_mag <= 2.15 * self.mass:
+                self.obj_active = 0.0
+                self.spaghetti_text.visible = False
+                self.timer.stop()
+                self.trigger_death(reason="spaghetti")
+                return
+            
+            # 3. GRAVITY INTEGRATION (Using a stronger Pseudo-Newtonian pull to guarantee ingestion)
+            acc_mag = (1.5 * self.mass) / (max(0.1, r_mag - 2.0 * self.mass)**2)
+            acc = -acc_mag * (self.obj_pos / r_mag)
+            
+            # Apply time dilation to the simulation step! It will visually slow to a halt.
+            dt_sim = 0.4 * dilation_factor 
+            self.obj_vel += acc * dt_sim 
+            self.obj_pos += self.obj_vel * dt_sim
+            
+            # 4. SPAGHETTIFICATION MATH (Tidal Forces)
+            dist_to_horizon = max(0.1, r_mag - 2.0 * self.mass)
+            stretch_curve = (3.5 * self.mass) / dist_to_horizon
+            self.obj_stretch = max(1.0, min(stretch_curve, 3.5)) # Caps stretch at 3.5x length
+            
+            self.update_simulation()
+
+    def trigger_death(self, reason="camera"):
         self.is_dead = True
+        
+        if reason == "spaghetti":
+            self.death_text.text = "OBJECT TERMINATED: Complete Spaghettification Reached.\nPress ENTER to restart"
+            self.death_text.color = '#ff33ff'
+        else:
+            self.death_text.text = "Satellite got caught in magnetic field of Blackhole\nPress ENTER to restart"
+            self.death_text.color = '#ff3333'
+            
         self.death_text.pos = (self.size[0] // 2, self.size[1] // 2)
         self.img_array.fill(0)
         self.img_array[:, :, 3] = 255 
         self.image.set_data(self.img_array)
         self.mass_text.visible = False
         self.filter_text.visible = False
+        self.spaghetti_text.visible = False
         self.death_text.visible = True
         self.update()
         
@@ -355,6 +526,11 @@ class BlackHoleCanvas(scene.SceneCanvas):
         
         render_cam_height = self.cam_height * scale_factor
         render_cam_dist = self.cam_dist * scale_factor
+        
+        # Scale the object coordinates perfectly into the C++ visual space
+        render_obj_x = self.obj_pos[0] * scale_factor
+        render_obj_y = self.obj_pos[1] * scale_factor
+        render_obj_z = self.obj_pos[2] * scale_factor
 
         render_kernel(
             cuda.InOut(self.img_array),
@@ -367,13 +543,18 @@ class BlackHoleCanvas(scene.SceneCanvas):
             np.float32(self.m87_mode),
             np.float32(self.zoom_factor),
             np.float32(self.optical_filter),
+            np.float32(self.obj_active),
+            np.float32(render_obj_x),
+            np.float32(render_obj_y),
+            np.float32(render_obj_z),
+            np.float32(self.obj_stretch),
             block=block_size, grid=grid_size
         )
         self.image.set_data(self.img_array)
         
-        # Keep updating position to the center of the screen when resized!
         self.mass_text.pos = (self.size[0] // 2, 40)
         self.filter_text.pos = (self.size[0] // 2, 80)
+        self.spaghetti_text.pos = (self.size[0] // 2, self.size[1] - 40)
         
         if self.ton_618_mode == 1.0:
             self.mass_text.text = f"Solar Mass: {self.mass:,.1f} M\nWARNING: TON 618 QUASAR DETECTED"
@@ -406,6 +587,8 @@ class BlackHoleCanvas(scene.SceneCanvas):
                 self.m87_mode = 0.0
                 self.zoom_factor = 1.0
                 self.is_dead = False
+                self.obj_active = 0.0
+                self.spaghetti_text.visible = False
                 self.death_text.visible = False
                 self.mass_text.visible = True
                 self.update_simulation()
@@ -420,7 +603,7 @@ class BlackHoleCanvas(scene.SceneCanvas):
             if ok and text:
                 val = text.strip().lower()
                 if val in ['ton 618', 'ton618']:
-                    self.mass = 66000000000.0 # 66 Billion
+                    self.mass = 66000000000.0
                     self.ton_618_mode = 1.0
                     self.m87_mode = 0.0
                     self.cam_dist = self.mass * 8.0 
@@ -428,7 +611,7 @@ class BlackHoleCanvas(scene.SceneCanvas):
                     self.zoom_factor = 1.0 
                     self.optical_filter = 1.0
                 elif val in ['m87', 'm 87', 'm-87']:
-                    self.mass = 6500000000.0 # 6.5 Billion (M87)
+                    self.mass = 6500000000.0
                     self.ton_618_mode = 0.0
                     self.m87_mode = 1.0
                     self.cam_dist = self.mass * 12.0 
@@ -455,20 +638,19 @@ class BlackHoleCanvas(scene.SceneCanvas):
             self.mass += step 
             self.update_simulation()
         elif event.text.lower() == 'j':
-            # Toggle the optical filter state
             self.optical_filter = 0.0 if self.optical_filter == 1.0 else 1.0
             self.update_simulation()
         elif event.text.lower() == 's':
             step = max(2.0, self.mass * 0.05)
             self.mass = max(2.0, self.mass - step) 
             self.update_simulation()
-        elif event.text.lower() == 'z': # Zoom In
+        elif event.text.lower() == 'z': 
             step = max(10.0, self.cam_dist * 0.05)
             self.cam_dist = max(min_dist, self.cam_dist - step) 
             self.cam_height = max(-self.cam_dist * 0.7, min(self.cam_dist * 0.7, self.cam_height))
             self.zoom_factor = max(0.4, self.zoom_factor * 0.95) 
             self.update_simulation()
-        elif event.text.lower() == 'x': # Zoom Out
+        elif event.text.lower() == 'x': 
             step = max(10.0, self.cam_dist * 0.05)
             self.cam_dist += step 
             self.zoom_factor = min(2.5, self.zoom_factor * 1.05) 
@@ -477,14 +659,14 @@ class BlackHoleCanvas(scene.SceneCanvas):
             step = max(4.0, self.cam_dist * 0.02)
             self.cam_height += step 
             if abs(self.cam_height) > max_height:
-                self.trigger_death()
+                self.trigger_death(reason="camera")
             else:
                 self.update_simulation()
         elif event.key.name == 'Down':
             step = max(4.0, self.cam_dist * 0.02)
             self.cam_height -= step 
             if abs(self.cam_height) > max_height:
-                self.trigger_death()
+                self.trigger_death(reason="camera")
             else:
                 self.update_simulation()
         elif event.text.lower() == 'r':
@@ -500,6 +682,7 @@ class BlackHoleCanvas(scene.SceneCanvas):
 if __name__ == '__main__':
     print("\n>>> System Status: Ready. Running execution pipeline loop...")
     print(">>> CONTROLS:")
+    print("    [Left-Click] Throw an object into the Black Hole")
     print("    [ I ] Open Input Dialog Box (Type 'TON 618' or 'M87')")
     print("    [ J ] Toggle Optical Filter (M87 Mode)")
     print("    [Z]/[X] Zoom IN / Zoom OUT")
