@@ -58,6 +58,7 @@ I: Open the Target Dialog box (Type M87 or TON 618).
 J: Toggle Optical Filter (Only available in M87 mode).
 
 W / S: Increase / Decrease Black Hole Mass.
+Left-click: Launch an astronaut dummy into the black hole.
 
 Z / X: Zoom In / Zoom Out.
 
